@@ -29,13 +29,16 @@ def fetch_and_post_events():
         events = response.json()
 
         for event in events:
+            if event.get("currency") != "USD":
+                continue  # Only process USD events
+
             event_id = event["id"]
             title = event["title"]
             impact = event["impact"]
             time_str = event["time"]
-            forecast = event.get("forecast", "N/A")  # Get forecast value (if available)
-            previous = event.get("previous", "N/A")  # Get previous value (if available)
-            actual = event.get("actual", "N/A")  # Get actual value (if available)
+            forecast = event.get("forecast", "N/A")
+            previous = event.get("previous", "N/A")
+            actual = event.get("actual", "N/A")
 
             # Convert time to a more readable format
             event_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")  # Example: '2025-04-17 14:00:00'
