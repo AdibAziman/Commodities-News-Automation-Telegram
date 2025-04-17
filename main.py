@@ -1,100 +1,154 @@
-from flask import Flask
-from threading import Thread
 import requests
 import json
 import os
+import pytz
+from datetime import datetime, timedelta
+from flask import Flask
 import time
-from datetime import datetime
+import threading
+import html
+
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL_ID = os.getenv("CHANNEL_ID")  # Example: "@yourchannel"
+DATA_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+TIMEZONE = pytz.timezone("Asia/Kuala_Lumpur")
 
 app = Flask(__name__)
 
-# Flask route (dummy) to keep the web service running
-@app.route('/')
-def index():
-    return "Bot is running"
+POSTED_FILE = "posted.json"
 
-# Function to send message to Telegram channel
-def send_to_telegram(message):
-    bot_token = os.getenv("BOT_TOKEN")  # Get bot token from environment
-    channel_id = os.getenv("CHANNEL_ID")  # Get channel ID from environment
-    url = f'https://api.telegram.org/bot{bot_token}/sendMessage?chat_id={channel_id}&text={message}'
-    response = requests.get(url)
-    return response.json()
+def load_posted():
+    if not os.path.exists(POSTED_FILE):
+        return {"daily": [], "alerts": []}
+    with open(POSTED_FILE, "r") as f:
+        return json.load(f)
 
-# Function to fetch economic calendar events (filtered by high/medium/low impact)
+def save_posted(posted):
+    with open(POSTED_FILE, "w") as f:
+        json.dump(posted, f)
+
+def escape_md(text):
+    return html.escape(text)
+
+def send_telegram_message(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {
+        "chat_id": CHANNEL_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    requests.post(url, data=data)
+
+def group_by_impact(events):
+    grouped = {"High": [], "Medium": [], "Low": []}
+    for event in events:
+        impact = event.get("impact", "")
+        if "high" in impact.lower():
+            grouped["High"].append(event)
+        elif "med" in impact.lower():
+            grouped["Medium"].append(event)
+        elif "low" in impact.lower():
+            grouped["Low"].append(event)
+    return grouped
+
+def format_event(event):
+    time_str = event["time"]
+    dt_utc = datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%S%z")
+    dt_my = dt_utc.astimezone(TIMEZONE)
+    clock = dt_my.strftime("%I:%M %p")
+
+    return f"<b>{escape_md(event['title'])}</b>\n" \
+           f"🕒 {clock} | {event['currency']}\n" \
+           f"📊 Forecast: {event.get('forecast', 'N/A')}\n" \
+           f"📉 Previous: {event.get('previous', 'N/A')}\n" \
+           f"📈 Actual: {event.get('actual', 'N/A')}"
+
 def fetch_and_post_events():
-    url = "https://www.forexfactory.com/ffcal_week_this.json"  # Forex Factory calendar JSON
-    response = requests.get(url)
-    if response.status_code == 200:
-        events = response.json()
-
-        for event in events:
-            if event.get("currency") != "USD":
-                continue  # Only process USD events
-
-            event_id = event["id"]
-            title = event["title"]
-            impact = event["impact"]
-            time_str = event["time"]
-            forecast = event.get("forecast", "N/A")
-            previous = event.get("previous", "N/A")
-            actual = event.get("actual", "N/A")
-
-            # Convert time to a more readable format
-            event_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")  # Example: '2025-04-17 14:00:00'
-            formatted_time = event_time.strftime("%Y-%m-%d %H:%M:%S")  # Change the format as needed
-
-            # Add emoji based on the event's impact level
-            if impact == 'High':
-                emoji = "🔴"  # Red circle for high impact
-            elif impact == 'Medium':
-                emoji = "🟡"  # Yellow circle for medium impact
-            elif impact == 'Low':
-                emoji = "🟢"  # Green circle for low impact
-            else:
-                emoji = "⚪"  # White circle if no impact is specified
-
-            # Format the message with event details, time, impact, forecast, previous, and actual data
-            message = (
-                f"Event: {title}\n"
-                f"Impact: {emoji} {impact}\n"
-                f"Time: {formatted_time}\n"
-                f"Forecast: {forecast}\n"
-                f"Previous: {previous}\n"
-                f"Actual: {actual}"
-            )
-            send_to_telegram(message)
-
-            # Store event ID in a JSON file to avoid sending it again
-            store_posted_event(event_id)
-
-def store_posted_event(event_id):
-    # Load existing posted events
-    if os.path.exists("posted.json"):
-        with open("posted.json", "r") as file:
-            posted_events = json.load(file)
-    else:
-        posted_events = []
-
-    # Check if the event ID is already posted
-    if event_id not in posted_events:
-        posted_events.append(event_id)
-
-        # Save back to posted.json
-        with open("posted.json", "w") as file:
-            json.dump(posted_events, file)
-
-# Function to run the Flask server in a separate thread
-def run():
-    app.run(host='0.0.0.0', port=8080)
-
-# Main function to keep the bot running
-if __name__ == "__main__":
-    # Start the Flask web server in a new thread
-    t = Thread(target=run)
-    t.start()
-
-    # Run bot logic to fetch and post events every 10 minutes
     while True:
-        fetch_and_post_events()
-        time.sleep(600)  # Sleep for 10 minutes before running again
+        try:
+            now = datetime.now(TIMEZONE)
+            posted = load_posted()
+
+            # Fetch data
+            res = requests.get(DATA_URL)
+            events = res.json()
+
+            # Filter USD events only
+            usd_events = [e for e in events if e.get("currency") == "USD"]
+
+            # --- DAILY SUMMARY at 10:00 AM ---
+            today_str = now.strftime("%Y-%m-%d")
+            if now.hour == 10 and now.minute < 10 and today_str not in posted["daily"]:
+                today_events = []
+                for e in usd_events:
+                    e_time = datetime.strptime(e["time"], "%Y-%m-%dT%H:%M:%S%z").astimezone(TIMEZONE)
+                    if e_time.date() == now.date():
+                        today_events.append(e)
+
+                grouped = group_by_impact(today_events)
+
+                if grouped["High"]:
+                    msg = "💥 <b>High Impact USD Events Today:</b>\n\n"
+                    msg += "\n\n".join(format_event(e) for e in grouped["High"])
+                    send_telegram_message(msg)
+
+                if grouped["Medium"]:
+                    msg = "⚠️ <b>Medium Impact USD Events Today:</b>\n\n"
+                    msg += "\n\n".join(format_event(e) for e in grouped["Medium"])
+                    send_telegram_message(msg)
+
+                if grouped["Low"]:
+                    msg = "🟢 <b>Low Impact USD Events Today:</b>\n\n"
+                    msg += "\n\n".join(format_event(e) for e in grouped["Low"])
+                    send_telegram_message(msg)
+
+                posted["daily"].append(today_str)
+                save_posted(posted)
+
+            # --- ALERTS 15 MINUTES BEFORE EVENT ---
+            for event in usd_events:
+                event_id = str(event["id"])
+                if event_id in posted["alerts"]:
+                    continue
+
+                event_time = datetime.strptime(event["time"], "%Y-%m-%dT%H:%M:%S%z").astimezone(TIMEZONE)
+                time_diff = (event_time - now).total_seconds() / 60
+
+                if 13 <= time_diff <= 17:  # Roughly 15 mins before
+                    # Impact icon
+                    impact = event.get("impact", "").lower()
+                    if "high" in impact:
+                        icon = "💥"
+                    elif "med" in impact:
+                        icon = "⚠️"
+                    elif "low" in impact:
+                        icon = "🟢"
+                    else:
+                        icon = "ℹ️"
+
+                    msg = f"📢 <b>Upcoming USD Event in 15 minutes:</b>\n\n{icon} {format_event(event)}"
+                    send_telegram_message(msg)
+                    posted["alerts"].append(event_id)
+                    save_posted(posted)
+
+        except Exception as e:
+            print("Error:", e)
+
+        time.sleep(600)  # Wait 10 minutes before next check
+
+# Flask root route
+@app.route("/")
+def home():
+    return "Forex Bot is running."
+
+# Start background thread
+threading.Thread(target=fetch_and_post_events, daemon=True).start()
+
+# Run Flask app
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
